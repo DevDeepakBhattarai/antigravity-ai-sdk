@@ -281,7 +281,7 @@ function parseSSE(body: ReadableStream<Uint8Array>): ReadableStream<LanguageMode
           const { done, value } = await reader.read();
           if (done) break;
           buf += dec.decode(value, { stream: true });
-          const evts = buf.split("\n\n");
+          const evts = buf.split(/\r?\n\r?\n/);
           buf = evts.pop() ?? "";
           for (const e of evts) { const j = sseData(e); if (j) emit(j as Record<string, unknown>, ctrl); }
         }
@@ -294,14 +294,16 @@ function parseSSE(body: ReadableStream<Uint8Array>): ReadableStream<LanguageMode
       }
 
       function sseData(raw: string): unknown | null {
-        for (const l of raw.split("\n")) {
+        const dataLines: string[] = [];
+        for (const l of raw.split(/\r?\n/)) {
           if (l.startsWith("data:")) {
-            const p = l.slice(5).trim();
-            if (!p || p === "[DONE]") return null;
-            try { return JSON.parse(p); } catch { return null; }
+            dataLines.push(l.slice(5).trim());
           }
         }
-        return null;
+        if (dataLines.length === 0) return null;
+        const payload = dataLines.join("\n").trim();
+        if (!payload || payload === "[DONE]") return null;
+        try { return JSON.parse(payload); } catch { return null; }
       }
 
       function emit(chunk: Record<string, unknown>, c: ReadableStreamDefaultController<LanguageModelV3StreamPart>) {
