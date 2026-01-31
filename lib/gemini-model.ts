@@ -11,7 +11,10 @@ import type {
 } from "@ai-sdk/provider";
 import { getValidAccessToken } from "./antigravity/token-manager";
 import { getProjectId } from "./antigravity/project-resolver";
-import { ANTIGRAVITY_HEADERS, CLOUDCODE_ENDPOINTS } from "./antigravity/constants";
+import {
+  ANTIGRAVITY_HEADERS,
+  CLOUDCODE_ENDPOINTS,
+} from "./antigravity/constants";
 import crypto from "node:crypto";
 
 // -- Gemini types --
@@ -29,7 +32,8 @@ type GeminiContent = { role: "user" | "model"; parts: GeminiPart[] };
 function toBase64(data: Uint8Array | string | URL): string {
   if (typeof data === "string") return data;
   if (data instanceof URL) throw new Error("URL file parts not supported");
-  if (typeof Buffer !== "undefined") return Buffer.from(data).toString("base64");
+  if (typeof Buffer !== "undefined")
+    return Buffer.from(data).toString("base64");
   let b = "";
   for (const byte of data) b += String.fromCharCode(byte);
   return btoa(b);
@@ -50,19 +54,30 @@ function convertPrompt(prompt: LanguageModelV3Message[]) {
       for (const p of msg.content) {
         if (p.type === "text") parts.push({ text: p.text });
         else if (p.type === "file")
-          parts.push({ inlineData: { mimeType: p.mediaType, data: toBase64(p.data) } });
+          parts.push({
+            inlineData: { mimeType: p.mediaType, data: toBase64(p.data) },
+          });
         else if (p.type === "tool-call")
           parts.push({
             functionCall: {
               name: p.toolName,
-              args: typeof p.input === "string" ? JSON.parse(p.input) : (p.input as Record<string, unknown>) ?? {},
+              args:
+                typeof p.input === "string"
+                  ? JSON.parse(p.input)
+                  : ((p.input as Record<string, unknown>) ?? {}),
             },
           });
         else if (p.type === "tool-result")
-          parts.push({ functionResponse: { name: p.toolName, response: extractResult(p) } });
+          parts.push({
+            functionResponse: { name: p.toolName, response: extractResult(p) },
+          });
         else if (p.type === "reasoning") parts.push({ text: p.text });
       }
-      if (parts.length) contents.push({ role: msg.role === "assistant" ? "model" : "user", parts });
+      if (parts.length)
+        contents.push({
+          role: msg.role === "assistant" ? "model" : "user",
+          parts,
+        });
       continue;
     }
 
@@ -70,7 +85,9 @@ function convertPrompt(prompt: LanguageModelV3Message[]) {
       const parts: GeminiPart[] = [];
       for (const p of msg.content) {
         if (p.type === "tool-result")
-          parts.push({ functionResponse: { name: p.toolName, response: extractResult(p) } });
+          parts.push({
+            functionResponse: { name: p.toolName, response: extractResult(p) },
+          });
       }
       if (parts.length) contents.push({ role: "user", parts });
     }
@@ -87,10 +104,12 @@ function convertPrompt(prompt: LanguageModelV3Message[]) {
 function extractResult(p: { output?: unknown; result?: unknown }): unknown {
   const o = p.output as { type?: string; value?: unknown } | undefined;
   if (o) {
-    if (o.type === "text" || o.type === "error-text") return { text: o.value ?? "" };
+    if (o.type === "text" || o.type === "error-text")
+      return { text: o.value ?? "" };
     if (o.type === "json" || o.type === "error-json") return o.value;
     if (o.type === "content") return o.value;
-    if (o.type === "execution-denied") return { error: "Tool execution denied" };
+    if (o.type === "execution-denied")
+      return { error: "Tool execution denied" };
   }
   return p.result ?? { text: "No result" };
 }
@@ -98,7 +117,11 @@ function extractResult(p: { output?: unknown; result?: unknown }): unknown {
 function convertTools(options: LanguageModelV3CallOptions) {
   const fns = options.tools?.filter((t) => t.type === "function");
   if (!fns?.length) return {};
-  const declarations = fns.map((t) => ({ name: t.name, description: t.description, parameters: t.inputSchema }));
+  const declarations = fns.map((t) => ({
+    name: t.name,
+    description: t.description,
+    parameters: t.inputSchema,
+  }));
   let toolConfig: unknown;
   if (options.toolChoice) {
     const tc = options.toolChoice;
@@ -106,27 +129,57 @@ function convertTools(options: LanguageModelV3CallOptions) {
     let allowed: string[] | undefined;
     if (tc.type === "none") mode = "NONE";
     else if (tc.type === "required") mode = "ANY";
-    else if (tc.type === "tool") { mode = "ANY"; allowed = [tc.toolName]; }
-    toolConfig = { functionCallingConfig: { mode, ...(allowed ? { allowedFunctionNames: allowed } : {}) } };
+    else if (tc.type === "tool") {
+      mode = "ANY";
+      allowed = [tc.toolName];
+    }
+    toolConfig = {
+      functionCallingConfig: {
+        mode,
+        ...(allowed ? { allowedFunctionNames: allowed } : {}),
+      },
+    };
   }
   return { tools: [{ functionDeclarations: declarations }], toolConfig };
 }
 
 function mapFinish(raw?: string): LanguageModelV3FinishReason {
   const r = (raw ?? "").toUpperCase();
-  const unified = r === "STOP" ? "stop" : r === "MAX_TOKENS" ? "length" : r === "SAFETY" || r === "RECITATION" ? "content-filter" : "other";
+  const unified =
+    r === "STOP"
+      ? "stop"
+      : r === "MAX_TOKENS"
+        ? "length"
+        : r === "SAFETY" || r === "RECITATION"
+          ? "content-filter"
+          : "other";
   return { unified, raw: raw ?? undefined };
 }
 
-function mapUsage(m?: { promptTokenCount?: number; candidatesTokenCount?: number }): LanguageModelV3Usage {
+function mapUsage(m?: {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  thoughtsTokenCount?: number;
+}): LanguageModelV3Usage {
   return {
-    inputTokens: { total: m?.promptTokenCount, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
-    outputTokens: { total: m?.candidatesTokenCount, text: undefined, reasoning: undefined },
+    inputTokens: {
+      total: m?.promptTokenCount,
+      noCache: undefined,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: {
+      total: m?.candidatesTokenCount,
+      text: undefined,
+      reasoning: m?.thoughtsTokenCount,
+    },
   };
 }
 
 let nextId = 0;
-function callId() { return `call_${Date.now().toString(36)}_${(nextId++).toString(36)}`; }
+function callId() {
+  return `call_${Date.now().toString(36)}_${(nextId++).toString(36)}`;
+}
 
 function buildHeaders(token: string): Record<string, string> {
   return {
@@ -136,38 +189,205 @@ function buildHeaders(token: string): Record<string, string> {
   };
 }
 
-function wrapBody(model: string, project: string, inner: Record<string, unknown>) {
-  return { project, model, request: inner, requestType: "agent", userAgent: "antigravity", requestId: `agent-${crypto.randomUUID()}` };
+type AntigravityThinkingOptions = {
+  enabled?: boolean;
+  includeThoughts?: boolean;
+  thinkingLevel?: "low" | "medium" | "high";
+  thinkingBudget?: number;
+};
+
+function resolveThinkingConfig(
+  options: LanguageModelV3CallOptions,
+): Record<string, unknown> | undefined {
+  const providerOptions = options.providerOptions as
+    | { antigravity?: { thinking?: AntigravityThinkingOptions } }
+    | undefined;
+  const thinking = providerOptions?.antigravity?.thinking;
+  if (!thinking || thinking.enabled === false) return undefined;
+
+  const config: Record<string, unknown> = {
+    includeThoughts: thinking.includeThoughts ?? true,
+  };
+  if (thinking.thinkingLevel) config.thinkingLevel = thinking.thinkingLevel;
+  if (thinking.thinkingBudget != null) config.thinkingBudget = thinking.thinkingBudget;
+  return config;
 }
 
-async function fetchFallback(action: string, headers: Record<string, string>, body: string, signal?: AbortSignal) {
+function wrapBody(
+  model: string,
+  project: string,
+  inner: Record<string, unknown>,
+) {
+  return {
+    project,
+    model,
+    request: inner,
+    requestType: "agent",
+    userAgent: "antigravity",
+    requestId: `agent-${crypto.randomUUID()}`,
+  };
+}
+
+async function fetchFallback(
+  action: string,
+  headers: Record<string, string>,
+  body: string,
+  signal?: AbortSignal,
+) {
   let last: Error | null = null;
   for (const base of CLOUDCODE_ENDPOINTS) {
     try {
-      return await fetch(`${base}/v1internal:${action}`, { method: "POST", headers, body, signal });
-    } catch (e) { last = e instanceof Error ? e : new Error(String(e)); }
+      return await fetch(`${base}/v1internal:${action}`, {
+        method: "POST",
+        headers,
+        body,
+        signal,
+      });
+    } catch (e) {
+      last = e instanceof Error ? e : new Error(String(e));
+    }
   }
   throw last ?? new Error("All endpoints failed");
 }
 
 function unwrap(json: Record<string, unknown>): Record<string, unknown> {
-  if (json.response && typeof json.response === "object") return json.response as Record<string, unknown>;
+  if (json.response && typeof json.response === "object")
+    return json.response as Record<string, unknown>;
   return json;
 }
 
 function parseContent(gemini: Record<string, unknown>) {
-  const cands = gemini.candidates as Array<{ content?: { parts?: Array<Record<string, unknown>> }; finishReason?: string }> | undefined;
-  const cand = cands?.[0];
-  const parts = cand?.content?.parts ?? [];
   const content: LanguageModelV3Content[] = [];
-  for (const p of parts) {
-    if (typeof p.text === "string") content.push({ type: "text", text: p.text });
-    else if (p.functionCall && typeof (p.functionCall as { name?: string }).name === "string") {
-      const fc = p.functionCall as { name: string; args?: Record<string, unknown> };
-      content.push({ type: "tool-call", toolCallId: callId(), toolName: fc.name, input: JSON.stringify(fc.args ?? {}) });
+  if (process.env.NODE_ENV !== "production") {
+    console.log(
+      "[gemini] parseContent raw response",
+      JSON.stringify(gemini).slice(0, 4000),
+    );
+  }
+
+  const pushReasoning = (text: string) => {
+    if (text) content.push({ type: "reasoning", text });
+  };
+
+  const pushText = (text: string) => {
+    if (text) content.push({ type: "text", text });
+  };
+
+  const parseParts = (parts: Array<Record<string, unknown>>) => {
+    for (const p of parts) {
+      if (
+        (p as { thought?: boolean }).thought === true ||
+        p.type === "thinking" ||
+        p.type === "reasoning"
+      ) {
+        const reasoningText =
+          typeof p.text === "string"
+            ? p.text
+            : typeof (p as { thinking?: string }).thinking === "string"
+              ? (p as { thinking?: string }).thinking
+              : "";
+        if (process.env.NODE_ENV !== "production") {
+          console.log("[gemini] reasoning part (non-stream)", {
+            type: p.type,
+            thought: (p as { thought?: boolean }).thought,
+            len: reasoningText?.length,
+          });
+        }
+        pushReasoning(reasoningText ?? "");
+        continue;
+      }
+      if (typeof p.text === "string") {
+        pushText(p.text);
+        continue;
+      }
+      if (
+        p.functionCall &&
+        typeof (p.functionCall as { name?: string }).name === "string"
+      ) {
+        const fc = p.functionCall as {
+          name: string;
+          args?: Record<string, unknown>;
+        };
+        content.push({
+          type: "tool-call",
+          toolCallId: callId(),
+          toolName: fc.name,
+          input: JSON.stringify(fc.args ?? {}),
+        });
+      }
+    }
+  };
+
+  const anthContent = gemini.content as
+    | Array<Record<string, unknown>>
+    | undefined;
+  if (Array.isArray(anthContent)) {
+    for (const block of anthContent) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "thinking") {
+        const reasoningText =
+          typeof block.thinking === "string"
+            ? block.thinking
+            : typeof block.text === "string"
+              ? block.text
+              : "";
+        if (process.env.NODE_ENV !== "production") {
+          console.log("[gemini] reasoning block (anth content)", {
+            len: reasoningText.length,
+          });
+        }
+        pushReasoning(reasoningText);
+        continue;
+      }
+      if (block.type === "text" && typeof block.text === "string") {
+        pushText(block.text);
+      }
+    }
+  } else {
+    const cands = gemini.candidates as
+      | Array<{
+          content?: { parts?: Array<Record<string, unknown>> };
+          finishReason?: string;
+        }>
+      | undefined;
+    const cand = cands?.[0];
+    const parts = cand?.content?.parts ?? [];
+    parseParts(parts);
+    if (cand?.finishReason) {
+      return {
+        content,
+        finishReason: cand.finishReason,
+        usage: gemini.usageMetadata as
+          | {
+              promptTokenCount?: number;
+              candidatesTokenCount?: number;
+              thoughtsTokenCount?: number;
+            }
+          | undefined,
+      };
     }
   }
-  return { content, finishReason: cand?.finishReason, usage: gemini.usageMetadata as { promptTokenCount?: number; candidatesTokenCount?: number } | undefined };
+
+  if (
+    typeof (gemini as { reasoning_content?: string }).reasoning_content ===
+    "string"
+  ) {
+    pushReasoning(
+      (gemini as { reasoning_content?: string }).reasoning_content ?? "",
+    );
+  }
+
+  return {
+    content,
+    finishReason: undefined,
+    usage: gemini.usageMetadata as
+      | {
+          promptTokenCount?: number;
+          candidatesTokenCount?: number;
+          thoughtsTokenCount?: number;
+        }
+      | undefined,
+  };
 }
 
 // -- Model factory --
@@ -179,7 +399,9 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
     modelId,
     supportedUrls: {},
 
-    async doGenerate(options: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult> {
+    async doGenerate(
+      options: LanguageModelV3CallOptions,
+    ): Promise<LanguageModelV3GenerateResult> {
       const token = await getValidAccessToken();
       const projectId = await getProjectId(token);
       const { contents, systemInstruction } = convertPrompt(options.prompt);
@@ -187,10 +409,14 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
 
       const gen: Record<string, unknown> = {};
       if (options.temperature != null) gen.temperature = options.temperature;
-      if (options.maxOutputTokens != null) gen.maxOutputTokens = options.maxOutputTokens;
+      if (options.maxOutputTokens != null)
+        gen.maxOutputTokens = options.maxOutputTokens;
       if (options.topP != null) gen.topP = options.topP;
       if (options.topK != null) gen.topK = options.topK;
-      if (options.stopSequences?.length) gen.stopSequences = options.stopSequences;
+      if (options.stopSequences?.length)
+        gen.stopSequences = options.stopSequences;
+      const thinkingConfig = resolveThinkingConfig(options);
+      if (thinkingConfig) gen.thinkingConfig = thinkingConfig;
 
       const inner: Record<string, unknown> = {
         contents,
@@ -202,7 +428,12 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
 
       const wrapped = wrapBody(modelId, projectId, inner);
       const headers = buildHeaders(token);
-      const res = await fetchFallback("generateContent", headers, JSON.stringify(wrapped), options.abortSignal);
+      const res = await fetchFallback(
+        "generateContent",
+        headers,
+        JSON.stringify(wrapped),
+        options.abortSignal,
+      );
 
       if (!res.ok) {
         const t = await res.text().catch(() => "");
@@ -219,11 +450,16 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
         usage: mapUsage(usage),
         warnings: [],
         request: { body: wrapped },
-        response: { headers: Object.fromEntries(res.headers.entries()), body: raw },
+        response: {
+          headers: Object.fromEntries(res.headers.entries()),
+          body: raw,
+        },
       };
     },
 
-    async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
+    async doStream(
+      options: LanguageModelV3CallOptions,
+    ): Promise<LanguageModelV3StreamResult> {
       const token = await getValidAccessToken();
       const projectId = await getProjectId(token);
       const { contents, systemInstruction } = convertPrompt(options.prompt);
@@ -231,10 +467,14 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
 
       const gen: Record<string, unknown> = {};
       if (options.temperature != null) gen.temperature = options.temperature;
-      if (options.maxOutputTokens != null) gen.maxOutputTokens = options.maxOutputTokens;
+      if (options.maxOutputTokens != null)
+        gen.maxOutputTokens = options.maxOutputTokens;
       if (options.topP != null) gen.topP = options.topP;
       if (options.topK != null) gen.topK = options.topK;
-      if (options.stopSequences?.length) gen.stopSequences = options.stopSequences;
+      if (options.stopSequences?.length)
+        gen.stopSequences = options.stopSequences;
+      const thinkingConfig = resolveThinkingConfig(options);
+      if (thinkingConfig) gen.thinkingConfig = thinkingConfig;
 
       const inner: Record<string, unknown> = {
         contents,
@@ -247,11 +487,18 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
       const wrapped = wrapBody(modelId, projectId, inner);
       const headers = buildHeaders(token);
       headers["Accept"] = "text/event-stream";
-      const res = await fetchFallback("streamGenerateContent?alt=sse", headers, JSON.stringify(wrapped), options.abortSignal);
+      const res = await fetchFallback(
+        "streamGenerateContent?alt=sse",
+        headers,
+        JSON.stringify(wrapped),
+        options.abortSignal,
+      );
 
       if (!res.ok) {
         const t = await res.text().catch(() => "");
-        throw new Error(`Gemini stream error ${res.status}: ${t || res.statusText}`);
+        throw new Error(
+          `Gemini stream error ${res.status}: ${t || res.statusText}`,
+        );
       }
       if (!res.body) throw new Error("No body in streaming response");
 
@@ -266,11 +513,15 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
 
 // -- SSE parser --
 
-function parseSSE(body: ReadableStream<Uint8Array>): ReadableStream<LanguageModelV3StreamPart> {
+function parseSSE(
+  body: ReadableStream<Uint8Array>,
+): ReadableStream<LanguageModelV3StreamPart> {
   let buf = "";
   let started = false;
   let textId: string | null = null;
   let accText = "";
+  let reasoningId: string | null = null;
+  let accReasoning = "";
 
   return new ReadableStream<LanguageModelV3StreamPart>({
     async start(ctrl) {
@@ -283,13 +534,31 @@ function parseSSE(body: ReadableStream<Uint8Array>): ReadableStream<LanguageMode
           buf += dec.decode(value, { stream: true });
           const evts = buf.split(/\r?\n\r?\n/);
           buf = evts.pop() ?? "";
-          for (const e of evts) { const j = sseData(e); if (j) emit(j as Record<string, unknown>, ctrl); }
+          for (const e of evts) {
+            const j = sseData(e);
+            if (j) emit(j as Record<string, unknown>, ctrl);
+          }
         }
-        if (buf.trim()) { const j = sseData(buf); if (j) emit(j as Record<string, unknown>, ctrl); }
-      } catch (err) { ctrl.enqueue({ type: "error", error: err }); }
-      finally {
-        if (textId) { ctrl.enqueue({ type: "text-end", id: textId }); textId = null; }
-        ctrl.enqueue({ type: "finish", finishReason: { unified: "other", raw: undefined }, usage: mapUsage() });
+        if (buf.trim()) {
+          const j = sseData(buf);
+          if (j) emit(j as Record<string, unknown>, ctrl);
+        }
+      } catch (err) {
+        ctrl.enqueue({ type: "error", error: err });
+      } finally {
+        if (textId) {
+          ctrl.enqueue({ type: "text-end", id: textId });
+          textId = null;
+        }
+        if (reasoningId) {
+          ctrl.enqueue({ type: "reasoning-end", id: reasoningId });
+          reasoningId = null;
+        }
+        ctrl.enqueue({
+          type: "finish",
+          finishReason: { unified: "other", raw: undefined },
+          usage: mapUsage(),
+        });
         ctrl.close();
       }
 
@@ -303,36 +572,180 @@ function parseSSE(body: ReadableStream<Uint8Array>): ReadableStream<LanguageMode
         if (dataLines.length === 0) return null;
         const payload = dataLines.join("\n").trim();
         if (!payload || payload === "[DONE]") return null;
-        try { return JSON.parse(payload); } catch { return null; }
+        try {
+          return JSON.parse(payload);
+        } catch {
+          return null;
+        }
       }
 
-      function emit(chunk: Record<string, unknown>, c: ReadableStreamDefaultController<LanguageModelV3StreamPart>) {
-        if (!started) { c.enqueue({ type: "stream-start", warnings: [] }); started = true; }
+      function emit(
+        chunk: Record<string, unknown>,
+        c: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+      ) {
+        if (!started) {
+          c.enqueue({ type: "stream-start", warnings: [] });
+          started = true;
+        }
         const inner = unwrap(chunk);
-        const cand = (inner.candidates as Array<{ content?: { parts?: Array<Record<string, unknown>> }; finishReason?: string }>)?.[0];
-        for (const p of cand?.content?.parts ?? []) {
-          if (typeof p.text === "string") {
-            const full = p.text;
-            const delta = full.startsWith(accText) ? full.slice(accText.length) : full;
-            if (delta) {
-              if (!textId) { textId = callId(); c.enqueue({ type: "text-start", id: textId }); }
-              c.enqueue({ type: "text-delta", id: textId, delta });
+        if (process.env.NODE_ENV !== "production") {
+          console.log(
+            "[gemini] stream chunk",
+            JSON.stringify(inner).slice(0, 2000),
+          );
+        }
+        const emitReasoning = (fullReasoning: string) => {
+          if (!fullReasoning) return;
+          const delta = fullReasoning.startsWith(accReasoning)
+            ? fullReasoning.slice(accReasoning.length)
+            : fullReasoning;
+          if (delta) {
+            if (!reasoningId) {
+              reasoningId = callId();
+              c.enqueue({ type: "reasoning-start", id: reasoningId });
             }
-            if (full.length >= accText.length) accText = full;
-          } else if (p.functionCall && typeof (p.functionCall as { name?: string }).name === "string") {
-            const fc = p.functionCall as { name: string; args?: Record<string, unknown> };
-            const id = callId();
-            c.enqueue({ type: "tool-input-start", id, toolName: fc.name });
-            const a = JSON.stringify(fc.args ?? {});
-            c.enqueue({ type: "tool-input-delta", id, delta: a });
-            c.enqueue({ type: "tool-input-end", id });
-            c.enqueue({ type: "tool-call", toolCallId: id, toolName: fc.name, input: a });
+            c.enqueue({ type: "reasoning-delta", id: reasoningId, delta });
+            if (process.env.NODE_ENV !== "production") {
+              console.log("[gemini] reasoning delta", delta.slice(0, 200));
+            }
+          }
+          if (fullReasoning.length >= accReasoning.length)
+            accReasoning = fullReasoning;
+        };
+
+        const emitText = (full: string) => {
+          if (!full) return;
+          const delta = full.startsWith(accText)
+            ? full.slice(accText.length)
+            : full;
+          if (delta) {
+            if (!textId) {
+              textId = callId();
+              c.enqueue({ type: "text-start", id: textId });
+            }
+            c.enqueue({ type: "text-delta", id: textId, delta });
+          }
+          if (full.length >= accText.length) accText = full;
+        };
+
+        const anthContent = inner.content as
+          | Array<Record<string, unknown>>
+          | undefined;
+        if (Array.isArray(anthContent)) {
+          for (const block of anthContent) {
+            if (!block || typeof block !== "object") continue;
+            if (block.type === "thinking") {
+              const reasoningText =
+                typeof block.thinking === "string"
+                  ? block.thinking
+                  : typeof block.text === "string"
+                    ? block.text
+                    : "";
+              emitReasoning(reasoningText);
+              continue;
+            }
+            if (block.type === "text" && typeof block.text === "string") {
+              emitText(block.text);
+            }
+          }
+        } else {
+          const cand = (
+            inner.candidates as Array<{
+              content?: { parts?: Array<Record<string, unknown>> };
+              finishReason?: string;
+            }>
+          )?.[0];
+          for (const p of cand?.content?.parts ?? []) {
+            if (
+              (p as { thought?: boolean }).thought === true ||
+              p.type === "thinking" ||
+              p.type === "reasoning"
+            ) {
+              const fullReasoning =
+                typeof p.text === "string"
+                  ? p.text
+                  : typeof (p as { thinking?: string }).thinking === "string"
+                    ? (p as { thinking?: string }).thinking
+                    : "";
+              emitReasoning(fullReasoning ?? "");
+            } else if (typeof p.text === "string") {
+              emitText(p.text);
+            } else if (
+              p.functionCall &&
+              typeof (p.functionCall as { name?: string }).name === "string"
+            ) {
+              const fc = p.functionCall as {
+                name: string;
+                args?: Record<string, unknown>;
+              };
+              const id = callId();
+              c.enqueue({ type: "tool-input-start", id, toolName: fc.name });
+              const a = JSON.stringify(fc.args ?? {});
+              c.enqueue({ type: "tool-input-delta", id, delta: a });
+              c.enqueue({ type: "tool-input-end", id });
+              c.enqueue({
+                type: "tool-call",
+                toolCallId: id,
+                toolName: fc.name,
+                input: a,
+              });
+            }
+          }
+          if (cand?.finishReason) {
+            if (textId) {
+              c.enqueue({ type: "text-end", id: textId });
+              textId = null;
+            }
+            if (reasoningId) {
+              c.enqueue({ type: "reasoning-end", id: reasoningId });
+              reasoningId = null;
+            }
+            const usage = inner.usageMetadata as
+              | {
+                  promptTokenCount?: number;
+                  candidatesTokenCount?: number;
+                  thoughtsTokenCount?: number;
+                }
+              | undefined;
+            c.enqueue({
+              type: "finish",
+              finishReason: mapFinish(cand.finishReason),
+              usage: mapUsage(usage),
+            });
+            return;
           }
         }
-        const usage = inner.usageMetadata as { promptTokenCount?: number; candidatesTokenCount?: number } | undefined;
-        if (cand?.finishReason) {
-          if (textId) { c.enqueue({ type: "text-end", id: textId }); textId = null; }
-          c.enqueue({ type: "finish", finishReason: mapFinish(cand.finishReason), usage: mapUsage(usage) });
+        if (
+          typeof (inner as { reasoning_content?: string }).reasoning_content ===
+          "string"
+        ) {
+          const reasoningText =
+            (inner as { reasoning_content?: string }).reasoning_content ?? "";
+          if (reasoningText) {
+            if (!reasoningId) {
+              reasoningId = callId();
+              c.enqueue({ type: "reasoning-start", id: reasoningId });
+            }
+            c.enqueue({
+              type: "reasoning-delta",
+              id: reasoningId,
+              delta: reasoningText,
+            });
+          }
+        }
+        const usage = inner.usageMetadata as
+          | {
+              promptTokenCount?: number;
+              candidatesTokenCount?: number;
+              thoughtsTokenCount?: number;
+            }
+          | undefined;
+        if (!reasoningId && !textId && usage) {
+          c.enqueue({
+            type: "finish",
+            finishReason: { unified: "other", raw: undefined },
+            usage: mapUsage(usage),
+          });
         }
       }
     },
