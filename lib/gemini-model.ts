@@ -16,13 +16,23 @@ import {
   CLOUDCODE_ENDPOINTS,
 } from "./antigravity/constants";
 import crypto from "node:crypto";
+import { convertJSONSchemaToOpenAPISchema } from "./schema-utils";
 
 // -- Gemini types --
 
 type GeminiPart =
-  | { text: string }
-  | { inlineData: { mimeType: string; data: string } }
-  | { functionCall: { name: string; args?: Record<string, unknown> } }
+  | { text: string; thought?: boolean; thoughtSignature?: string }
+  | {
+      inlineData: { mimeType: string; data: string };
+      thoughtSignature?: string;
+    }
+  | {
+      functionCall: {
+        name: string;
+        args?: Record<string, unknown>;
+      };
+      thoughtSignature?: string;
+    }
   | { functionResponse: { name: string; response: unknown } };
 
 type GeminiContent = { role: "user" | "model"; parts: GeminiPart[] };
@@ -30,7 +40,15 @@ type GeminiContent = { role: "user" | "model"; parts: GeminiPart[] };
 // -- Helpers --
 
 function toBase64(data: Uint8Array | string | URL): string {
-  if (typeof data === "string") return data;
+  if (typeof data === "string") {
+    if (data.startsWith("data:")) {
+      const commaIndex = data.indexOf(",");
+      if (commaIndex !== -1) {
+        return data.slice(commaIndex + 1);
+      }
+    }
+    return data;
+  }
   if (data instanceof URL) throw new Error("URL file parts not supported");
   if (typeof Buffer !== "undefined")
     return Buffer.from(data).toString("base64");
@@ -39,25 +57,46 @@ function toBase64(data: Uint8Array | string | URL): string {
   return btoa(b);
 }
 
-function convertPrompt(prompt: LanguageModelV3Message[]) {
-  const systemParts: string[] = [];
+function convertPrompt(
+  prompt: LanguageModelV3Message[],
+  providerOptionsName = "gemini-oauth",
+) {
+  const systemParts: { text: string }[] = [];
   const contents: GeminiContent[] = [];
 
   for (const msg of prompt) {
     if (msg.role === "system") {
-      systemParts.push(msg.content);
+      systemParts.push({ text: msg.content });
       continue;
     }
 
     if (msg.role === "user" || msg.role === "assistant") {
       const parts: GeminiPart[] = [];
       for (const p of msg.content) {
-        if (p.type === "text") parts.push({ text: p.text });
-        else if (p.type === "file")
+        const anyPart = p as unknown as {
+          providerMetadata?: Record<string, Record<string, unknown>>;
+          providerOptions?: Record<string, Record<string, unknown>>;
+        };
+        const providerOpts =
+          anyPart.providerMetadata?.[providerOptionsName] ??
+          anyPart.providerOptions?.[providerOptionsName];
+
+        const thoughtSignature =
+          providerOpts?.thoughtSignature != null
+            ? String(providerOpts.thoughtSignature)
+            : undefined;
+
+        if (p.type === "text") {
+          parts.push({
+            text: p.text,
+            thoughtSignature,
+          });
+        } else if (p.type === "file") {
           parts.push({
             inlineData: { mimeType: p.mediaType, data: toBase64(p.data) },
+            thoughtSignature,
           });
-        else if (p.type === "tool-call")
+        } else if (p.type === "tool-call") {
           parts.push({
             functionCall: {
               name: p.toolName,
@@ -66,28 +105,37 @@ function convertPrompt(prompt: LanguageModelV3Message[]) {
                   ? JSON.parse(p.input)
                   : ((p.input as Record<string, unknown>) ?? {}),
             },
+            thoughtSignature,
           });
-        else if (p.type === "tool-result")
+        } else if (p.type === "tool-result") {
           parts.push({
             functionResponse: { name: p.toolName, response: extractResult(p) },
           });
-        else if (p.type === "reasoning") parts.push({ text: p.text });
+        } else if (p.type === "reasoning") {
+          parts.push({
+            text: p.text,
+            thought: true,
+            thoughtSignature,
+          });
+        }
       }
-      if (parts.length)
+      if (parts.length) {
         contents.push({
           role: msg.role === "assistant" ? "model" : "user",
           parts,
         });
+      }
       continue;
     }
 
     if (msg.role === "tool") {
       const parts: GeminiPart[] = [];
       for (const p of msg.content) {
-        if (p.type === "tool-result")
+        if (p.type === "tool-result") {
           parts.push({
             functionResponse: { name: p.toolName, response: extractResult(p) },
           });
+        }
       }
       if (parts.length) contents.push({ role: "user", parts });
     }
@@ -96,7 +144,7 @@ function convertPrompt(prompt: LanguageModelV3Message[]) {
   return {
     contents,
     systemInstruction: systemParts.length
-      ? { role: "user" as const, parts: systemParts.map((t) => ({ text: t })) }
+      ? { role: "user" as const, parts: systemParts }
       : undefined,
   };
 }
@@ -105,34 +153,42 @@ function extractResult(p: { output?: unknown; result?: unknown }): unknown {
   const o = p.output as { type?: string; value?: unknown } | undefined;
   if (o) {
     if (o.type === "text" || o.type === "error-text")
-      return { text: o.value ?? "" };
+      return { content: o.value ?? "" }; // Google expects 'content' key often for simple text
     if (o.type === "json" || o.type === "error-json") return o.value;
-    if (o.type === "content") return o.value;
+    if (o.type === "content")
+      return typeof o.value === "string" ? { content: o.value } : o.value;
     if (o.type === "execution-denied")
       return { error: "Tool execution denied" };
   }
-  return p.result ?? { text: "No result" };
+  // Fallback for simple result
+  return typeof p.result === "string" ? { content: p.result } : p.result;
 }
 
-function convertTools(options: LanguageModelV3CallOptions) {
+async function convertTools(options: LanguageModelV3CallOptions) {
   const fns = options.tools?.filter((t) => t.type === "function");
   if (!fns?.length) return {};
-  const declarations = fns.map((t) => ({
-    name: t.name,
-    description: t.description,
-    parameters: t.inputSchema,
-  }));
+
+  const declarations = await Promise.all(
+    fns.map(async (t) => ({
+      name: t.name,
+      description: t.description,
+      parameters: convertJSONSchemaToOpenAPISchema(t.inputSchema),
+    })),
+  );
+
   let toolConfig: unknown;
   if (options.toolChoice) {
     const tc = options.toolChoice;
     let mode: string = "AUTO";
     let allowed: string[] | undefined;
+
     if (tc.type === "none") mode = "NONE";
     else if (tc.type === "required") mode = "ANY";
     else if (tc.type === "tool") {
       mode = "ANY";
       allowed = [tc.toolName];
     }
+
     toolConfig = {
       functionCallingConfig: {
         mode,
@@ -140,6 +196,7 @@ function convertTools(options: LanguageModelV3CallOptions) {
       },
     };
   }
+
   return { tools: [{ functionDeclarations: declarations }], toolConfig };
 }
 
@@ -163,13 +220,13 @@ function mapUsage(m?: {
 }): LanguageModelV3Usage {
   return {
     inputTokens: {
-      total: m?.promptTokenCount,
+      total: m?.promptTokenCount ?? 0,
       noCache: undefined,
       cacheRead: undefined,
       cacheWrite: undefined,
     },
     outputTokens: {
-      total: m?.candidatesTokenCount,
+      total: m?.candidatesTokenCount ?? 0,
       text: undefined,
       reasoning: m?.thoughtsTokenCount,
     },
@@ -209,7 +266,8 @@ function resolveThinkingConfig(
     includeThoughts: thinking.includeThoughts ?? true,
   };
   if (thinking.thinkingLevel) config.thinkingLevel = thinking.thinkingLevel;
-  if (thinking.thinkingBudget != null) config.thinkingBudget = thinking.thinkingBudget;
+  if (thinking.thinkingBudget != null)
+    config.thinkingBudget = thinking.thinkingBudget;
   return config;
 }
 
@@ -256,7 +314,7 @@ function unwrap(json: Record<string, unknown>): Record<string, unknown> {
   return json;
 }
 
-function parseContent(gemini: Record<string, unknown>) {
+const parseContent = (gemini: Record<string, unknown>) => {
   const content: LanguageModelV3Content[] = [];
   if (process.env.NODE_ENV !== "production") {
     console.log(
@@ -265,16 +323,33 @@ function parseContent(gemini: Record<string, unknown>) {
     );
   }
 
-  const pushReasoning = (text: string) => {
-    if (text) content.push({ type: "reasoning", text });
+  const pushReasoning = (text: string, signature?: string) => {
+    if (text)
+      content.push({
+        type: "reasoning",
+        text,
+        providerMetadata: signature
+          ? { "gemini-oauth": { thoughtSignature: signature } }
+          : undefined,
+      });
   };
 
-  const pushText = (text: string) => {
-    if (text) content.push({ type: "text", text });
+  const pushText = (text: string, signature?: string) => {
+    if (text)
+      content.push({
+        type: "text",
+        text,
+        providerMetadata: signature
+          ? { "gemini-oauth": { thoughtSignature: signature } }
+          : undefined,
+      });
   };
 
   const parseParts = (parts: Array<Record<string, unknown>>) => {
     for (const p of parts) {
+      const signature =
+        typeof p.thoughtSignature === "string" ? p.thoughtSignature : undefined;
+
       if (
         (p as { thought?: boolean }).thought === true ||
         p.type === "thinking" ||
@@ -286,18 +361,11 @@ function parseContent(gemini: Record<string, unknown>) {
             : typeof (p as { thinking?: string }).thinking === "string"
               ? (p as { thinking?: string }).thinking
               : "";
-        if (process.env.NODE_ENV !== "production") {
-          console.log("[gemini] reasoning part (non-stream)", {
-            type: p.type,
-            thought: (p as { thought?: boolean }).thought,
-            len: reasoningText?.length,
-          });
-        }
-        pushReasoning(reasoningText ?? "");
+        pushReasoning(reasoningText ?? "", signature);
         continue;
       }
       if (typeof p.text === "string") {
-        pushText(p.text);
+        pushText(p.text, signature);
         continue;
       }
       if (
@@ -313,15 +381,42 @@ function parseContent(gemini: Record<string, unknown>) {
           toolCallId: callId(),
           toolName: fc.name,
           input: JSON.stringify(fc.args ?? {}),
+          providerMetadata: signature
+            ? { "gemini-oauth": { thoughtSignature: signature } }
+            : undefined,
+        });
+      }
+      if (p.inlineData) {
+        // Handle inline images/data
+        const id = p.inlineData as { mimeType: string; data: string };
+        content.push({
+          type: "file",
+          mediaType: id.mimeType,
+          data: id.data,
+          providerMetadata: signature
+            ? { "gemini-oauth": { thoughtSignature: signature } }
+            : undefined,
         });
       }
     }
   };
 
+  const cands = gemini.candidates as
+    | Array<{
+        content?: { parts?: Array<Record<string, unknown>> };
+        finishReason?: string;
+      }>
+    | undefined;
+
+  const cand = cands?.[0];
+  const parts = cand?.content?.parts ?? [];
+  parseParts(parts);
+
+  // If there's content directly in the object (Anthropic-style wrapper sometimes seen in internal proxies)
   const anthContent = gemini.content as
     | Array<Record<string, unknown>>
     | undefined;
-  if (Array.isArray(anthContent)) {
+  if (Array.isArray(anthContent) && content.length === 0) {
     for (const block of anthContent) {
       if (!block || typeof block !== "object") continue;
       if (block.type === "thinking") {
@@ -331,64 +426,30 @@ function parseContent(gemini: Record<string, unknown>) {
             : typeof block.text === "string"
               ? block.text
               : "";
-        if (process.env.NODE_ENV !== "production") {
-          console.log("[gemini] reasoning block (anth content)", {
-            len: reasoningText.length,
-          });
-        }
-        pushReasoning(reasoningText);
+        pushReasoning(reasoningText, undefined); // AnthContent usually doesn't have signature like this
         continue;
       }
       if (block.type === "text" && typeof block.text === "string") {
-        pushText(block.text);
+        pushText(block.text, undefined);
       }
-    }
-  } else {
-    const cands = gemini.candidates as
-      | Array<{
-          content?: { parts?: Array<Record<string, unknown>> };
-          finishReason?: string;
-        }>
-      | undefined;
-    const cand = cands?.[0];
-    const parts = cand?.content?.parts ?? [];
-    parseParts(parts);
-    if (cand?.finishReason) {
-      return {
-        content,
-        finishReason: cand.finishReason,
-        usage: gemini.usageMetadata as
-          | {
-              promptTokenCount?: number;
-              candidatesTokenCount?: number;
-              thoughtsTokenCount?: number;
-            }
-          | undefined,
-      };
     }
   }
 
-  if (
-    typeof (gemini as { reasoning_content?: string }).reasoning_content ===
-    "string"
-  ) {
-    pushReasoning(
-      (gemini as { reasoning_content?: string }).reasoning_content ?? "",
-    );
-  }
+  // Handle usage
+  const usage = gemini.usageMetadata as
+    | {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        thoughtsTokenCount?: number;
+      }
+    | undefined;
 
   return {
     content,
-    finishReason: undefined,
-    usage: gemini.usageMetadata as
-      | {
-          promptTokenCount?: number;
-          candidatesTokenCount?: number;
-          thoughtsTokenCount?: number;
-        }
-      | undefined,
+    finishReason: cand?.finishReason,
+    usage,
   };
-}
+};
 
 // -- Model factory --
 
@@ -405,7 +466,7 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
       const token = await getValidAccessToken();
       const projectId = await getProjectId(token);
       const { contents, systemInstruction } = convertPrompt(options.prompt);
-      const { tools, toolConfig } = convertTools(options);
+      const { tools, toolConfig } = await convertTools(options);
 
       const gen: Record<string, unknown> = {};
       if (options.temperature != null) gen.temperature = options.temperature;
@@ -463,7 +524,7 @@ export function createGeminiOAuth(modelId: string): LanguageModelV3 {
       const token = await getValidAccessToken();
       const projectId = await getProjectId(token);
       const { contents, systemInstruction } = convertPrompt(options.prompt);
-      const { tools, toolConfig } = convertTools(options);
+      const { tools, toolConfig } = await convertTools(options);
 
       const gen: Record<string, unknown> = {};
       if (options.temperature != null) gen.temperature = options.temperature;
@@ -594,68 +655,22 @@ function parseSSE(
             JSON.stringify(inner).slice(0, 2000),
           );
         }
-        const emitReasoning = (fullReasoning: string) => {
-          if (!fullReasoning) return;
-          const delta = fullReasoning.startsWith(accReasoning)
-            ? fullReasoning.slice(accReasoning.length)
-            : fullReasoning;
-          if (delta) {
-            if (!reasoningId) {
-              reasoningId = callId();
-              c.enqueue({ type: "reasoning-start", id: reasoningId });
-            }
-            c.enqueue({ type: "reasoning-delta", id: reasoningId, delta });
-            if (process.env.NODE_ENV !== "production") {
-              console.log("[gemini] reasoning delta", delta.slice(0, 200));
-            }
-          }
-          if (fullReasoning.length >= accReasoning.length)
-            accReasoning = fullReasoning;
-        };
 
-        const emitText = (full: string) => {
-          if (!full) return;
-          const delta = full.startsWith(accText)
-            ? full.slice(accText.length)
-            : full;
-          if (delta) {
-            if (!textId) {
-              textId = callId();
-              c.enqueue({ type: "text-start", id: textId });
-            }
-            c.enqueue({ type: "text-delta", id: textId, delta });
-          }
-          if (full.length >= accText.length) accText = full;
-        };
+        // Handle Candidates
+        const cand = (
+          inner.candidates as Array<{
+            content?: { parts?: Array<Record<string, unknown>> };
+            finishReason?: string;
+          }>
+        )?.[0];
 
-        const anthContent = inner.content as
-          | Array<Record<string, unknown>>
-          | undefined;
-        if (Array.isArray(anthContent)) {
-          for (const block of anthContent) {
-            if (!block || typeof block !== "object") continue;
-            if (block.type === "thinking") {
-              const reasoningText =
-                typeof block.thinking === "string"
-                  ? block.thinking
-                  : typeof block.text === "string"
-                    ? block.text
-                    : "";
-              emitReasoning(reasoningText);
-              continue;
-            }
-            if (block.type === "text" && typeof block.text === "string") {
-              emitText(block.text);
-            }
-          }
-        } else {
-          const cand = (
-            inner.candidates as Array<{
-              content?: { parts?: Array<Record<string, unknown>> };
-              finishReason?: string;
-            }>
-          )?.[0];
-          for (const p of cand?.content?.parts ?? []) {
+        if (cand?.content?.parts) {
+          for (const p of cand.content.parts) {
+            const signature =
+              typeof p.thoughtSignature === "string"
+                ? p.thoughtSignature
+                : undefined;
+
             if (
               (p as { thought?: boolean }).thought === true ||
               p.type === "thinking" ||
@@ -667,9 +682,9 @@ function parseSSE(
                   : typeof (p as { thinking?: string }).thinking === "string"
                     ? (p as { thinking?: string }).thinking
                     : "";
-              emitReasoning(fullReasoning ?? "");
+              emitReasoning(fullReasoning ?? "", signature);
             } else if (typeof p.text === "string") {
-              emitText(p.text);
+              emitText(p.text, signature);
             } else if (
               p.functionCall &&
               typeof (p.functionCall as { name?: string }).name === "string"
@@ -678,6 +693,7 @@ function parseSSE(
                 name: string;
                 args?: Record<string, unknown>;
               };
+              // For tool calls, we need a unique ID for the call
               const id = callId();
               c.enqueue({ type: "tool-input-start", id, toolName: fc.name });
               const a = JSON.stringify(fc.args ?? {});
@@ -688,51 +704,38 @@ function parseSSE(
                 toolCallId: id,
                 toolName: fc.name,
                 input: a,
+                providerMetadata: signature
+                  ? { "gemini-oauth": { thoughtSignature: signature } }
+                  : undefined,
               });
             }
           }
-          if (cand?.finishReason) {
-            if (textId) {
-              c.enqueue({ type: "text-end", id: textId });
-              textId = null;
-            }
-            if (reasoningId) {
-              c.enqueue({ type: "reasoning-end", id: reasoningId });
-              reasoningId = null;
-            }
-            const usage = inner.usageMetadata as
-              | {
-                  promptTokenCount?: number;
-                  candidatesTokenCount?: number;
-                  thoughtsTokenCount?: number;
-                }
-              | undefined;
-            c.enqueue({
-              type: "finish",
-              finishReason: mapFinish(cand.finishReason),
-              usage: mapUsage(usage),
-            });
-            return;
-          }
         }
-        if (
-          typeof (inner as { reasoning_content?: string }).reasoning_content ===
-          "string"
-        ) {
-          const reasoningText =
-            (inner as { reasoning_content?: string }).reasoning_content ?? "";
-          if (reasoningText) {
-            if (!reasoningId) {
-              reasoningId = callId();
-              c.enqueue({ type: "reasoning-start", id: reasoningId });
-            }
-            c.enqueue({
-              type: "reasoning-delta",
-              id: reasoningId,
-              delta: reasoningText,
-            });
+
+        if (cand?.finishReason) {
+          if (textId) {
+            c.enqueue({ type: "text-end", id: textId });
+            textId = null;
           }
+          if (reasoningId) {
+            c.enqueue({ type: "reasoning-end", id: reasoningId });
+            reasoningId = null;
+          }
+          const usage = inner.usageMetadata as
+            | {
+                promptTokenCount?: number;
+                candidatesTokenCount?: number;
+                thoughtsTokenCount?: number;
+              }
+            | undefined;
+          c.enqueue({
+            type: "finish",
+            finishReason: mapFinish(cand.finishReason),
+            usage: mapUsage(usage),
+          });
+          return;
         }
+
         const usage = inner.usageMetadata as
           | {
               promptTokenCount?: number;
@@ -740,12 +743,73 @@ function parseSSE(
               thoughtsTokenCount?: number;
             }
           | undefined;
-        if (!reasoningId && !textId && usage) {
+
+        // If we have usage but no finish reason (sometimes happens at end of stream), emit finish
+        if (!cand && usage) {
+          if (textId) {
+            c.enqueue({ type: "text-end", id: textId });
+            textId = null;
+          }
+          if (reasoningId) {
+            c.enqueue({ type: "reasoning-end", id: reasoningId });
+            reasoningId = null;
+          }
+
           c.enqueue({
             type: "finish",
             finishReason: { unified: "other", raw: undefined },
             usage: mapUsage(usage),
           });
+        }
+
+        function emitReasoning(fullReasoning: string, signature?: string) {
+          if (!fullReasoning) return;
+          const delta = fullReasoning.startsWith(accReasoning)
+            ? fullReasoning.slice(accReasoning.length)
+            : fullReasoning;
+          if (delta) {
+            if (!reasoningId) {
+              reasoningId = callId();
+              c.enqueue({
+                type: "reasoning-start",
+                id: reasoningId,
+                providerMetadata: signature
+                  ? { "gemini-oauth": { thoughtSignature: signature } }
+                  : undefined,
+              });
+            }
+            c.enqueue({
+              type: "reasoning-delta",
+              id: reasoningId,
+              delta,
+            });
+            if (process.env.NODE_ENV !== "production") {
+              console.log("[gemini] reasoning delta", delta.slice(0, 200));
+            }
+          }
+          if (fullReasoning.length >= accReasoning.length)
+            accReasoning = fullReasoning;
+        }
+
+        function emitText(full: string, signature?: string) {
+          if (!full) return;
+          const delta = full.startsWith(accText)
+            ? full.slice(accText.length)
+            : full;
+          if (delta) {
+            if (!textId) {
+              textId = callId();
+              c.enqueue({
+                type: "text-start",
+                id: textId,
+                providerMetadata: signature
+                  ? { "gemini-oauth": { thoughtSignature: signature } }
+                  : undefined,
+              });
+            }
+            c.enqueue({ type: "text-delta", id: textId, delta });
+          }
+          if (full.length >= accText.length) accText = full;
         }
       }
     },
